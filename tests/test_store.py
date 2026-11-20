@@ -227,3 +227,293 @@ def test_corrupt_register_blob_is_rejected_on_read(tmp_path):
     conn.close()
     with pytest.raises(hll.SketchError):
         storage.get_daily("v1", "2026-12-01")
+
+
+# -- legacy (version-1) database migration ---------------------------------
+
+
+def _legacy_db(tmp_path):
+    """Create a database in the original pre-fix (user_version=0) layout."""
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.executescript(
+        """
+        CREATE TABLE daily_sketch (
+            venue_id      TEXT    NOT NULL,
+            day           TEXT    NOT NULL,
+            revision      INTEGER NOT NULL,
+            p             INTEGER NOT NULL,
+            registers     BLOB    NOT NULL,
+            content_hash  TEXT    NOT NULL,
+            updated_at    TEXT    NOT NULL,
+            PRIMARY KEY (venue_id, day)
+        );
+        CREATE TABLE monthly_summary (
+            month        TEXT    PRIMARY KEY,
+            p            INTEGER NOT NULL,
+            registers    BLOB    NOT NULL,
+            day_count    INTEGER NOT NULL,
+            venue_count  INTEGER NOT NULL,
+            updated_at   TEXT    NOT NULL
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 0")
+    return conn, path
+
+
+def _legacy_insert(conn, venue_id, day, revision, p, registers):
+    from app.store import content_fingerprint, utc_now
+
+    conn.execute(
+        "INSERT INTO daily_sketch "
+        "(venue_id, day, revision, p, registers, content_hash, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            venue_id,
+            day,
+            revision,
+            p,
+            bytes(registers),
+            content_fingerprint(p, registers),
+            utc_now(),
+        ),
+    )
+
+
+def test_migration_strips_lf_and_merges_matching_top_revision(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    regs_low = sketch(["t1", "t2"], 4)
+    regs_same_p_same_regs = list(regs_low)
+    # The LF-suffixed copy arrives at a higher revision but identical precision
+    # and registers once folded: the venue-day must merge into one current row.
+    _legacy_insert(conn, "museum-a", "2026-03-04", 1, 4, regs_low)
+    _legacy_insert(conn, "museum-a\n", "2026-03-04", 2, 4, regs_same_p_same_regs)
+    # Stale revisions are dropped during the highest-revision compaction.
+    _legacy_insert(conn, "museum-a\n", "2026-03-05", 7, 4, sketch(["x"], 4))
+    _legacy_insert(conn, "museum-a", "2026-03-05", 9, 4, sketch(["y"], 4))
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 2
+
+    # No LF venue ids survive anywhere.
+    check = sqlite3.connect(path)
+    dirty = check.execute(
+        "SELECT COUNT(*) FROM daily_sketch WHERE venue_id LIKE '%\n'"
+    ).fetchone()[0]
+    dirty += check.execute(
+        "SELECT COUNT(*) FROM daily_conflict WHERE venue_id LIKE '%\n'"
+    ).fetchone()[0]
+    assert dirty == 0
+    check.close()
+
+    day4 = storage.get_daily("museum-a", "2026-03-04")
+    assert day4 is not None
+    assert day4.revision == 2
+    assert day4.registers == regs_low
+    assert storage.get_conflict_day("museum-a", "2026-03-04") is None
+
+    day5 = storage.get_daily("museum-a", "2026-03-05")
+    assert day5.revision == 9
+    assert day5.registers == sketch(["y"], 4)
+
+    # The month reports normally and counts a single venue over two days.
+    summary = storage.get_monthly("2026-03")
+    assert summary is not None
+    assert summary.venue_count == 1
+    assert summary.day_count == 2
+    expected = hll.merge_sketches([(4, regs_low), (4, sketch(["y"], 4))])
+    assert summary.registers == expected
+
+
+def test_migration_keeps_distinct_top_revisions_as_conflicts(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    variant_a = sketch(["ticket-a"], 4)
+    variant_b = sketch(["ticket-b"], 5)
+    _legacy_insert(conn, "museum-a", "2026-03-04", 3, 4, variant_a)
+    _legacy_insert(conn, "museum-a\n", "2026-03-04", 3, 5, variant_b)
+    # A stale lower revision under a third spelling (e.g. CRLF) is dropped,
+    # not preserved, since only highest revisions are compacted.
+    _legacy_insert(conn, "museum-a\r\n", "2026-03-04", 1, 4, sketch(["old"], 4))
+    # A second venue-day in the same month stays clean.
+    clean_regs = sketch(["clean"], 6)
+    _legacy_insert(conn, "museum-b", "2026-03-09", 1, 6, clean_regs)
+    # The old, polluted summary must not survive.
+    conn.execute(
+        "INSERT INTO monthly_summary "
+        "(month, p, registers, day_count, venue_count, updated_at) "
+        "VALUES ('2026-03', 6, ?, 1, 2, '2026-01-01T00:00:00+00:00')",
+        (bytes(64),),
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+
+    # The conflicted venue-day has no current row, two kept originals, and the
+    # stale revision-1 variant is gone.
+    assert storage.get_daily("museum-a", "2026-03-04") is None
+    conflict = storage.get_conflict_day("museum-a", "2026-03-04")
+    assert conflict is not None
+    assert conflict.highest_revision == 3
+    assert conflict.required_revision == 4
+    assert {v.revision for v in conflict.variants} == {3}
+    assert {v.p for v in conflict.variants} == {4, 5}
+    kept_registers = {tuple(v.registers) for v in conflict.variants}
+    assert kept_registers == {tuple(variant_a), tuple(variant_b)}
+
+    # Month output is withdrawn while the conflict exists.
+    assert storage.get_monthly("2026-03") is None
+    assert [c.day for c in storage.get_conflicts("2026-03")] == ["2026-03-04"]
+    # Other months are untouched.
+    assert storage.get_conflicts("2026-02") == []
+
+
+def test_migration_crlf_suffix_is_stripped(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    regs = sketch(["t1"], 4)
+    _legacy_insert(conn, "museum-a\r\n", "2026-03-04", 1, 4, regs)
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    stored = storage.get_daily("museum-a", "2026-03-04")
+    assert stored is not None
+    assert stored.revision == 1
+    assert storage.get_monthly("2026-03") is not None
+
+
+def test_migration_is_idempotent_across_reopens(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    _legacy_insert(conn, "museum-a", "2026-03-04", 1, 4, sketch(["a"], 4))
+    _legacy_insert(conn, "museum-a\n", "2026-03-04", 2, 4, sketch(["a"], 4))
+    conn.commit()
+    conn.close()
+
+    first = Storage(path)
+    first_summary = first.get_monthly("2026-03")
+    reopened = Storage(path)  # must not re-migrate or duplicate rows
+    check = sqlite3.connect(path)
+    assert check.execute("SELECT COUNT(*) FROM daily_sketch").fetchone()[0] == 1
+    assert check.execute("SELECT COUNT(*) FROM daily_conflict").fetchone()[0] == 0
+    assert check.execute("PRAGMA user_version").fetchone()[0] == 2
+    check.close()
+    assert reopened.get_monthly("2026-03").updated_at == first_summary.updated_at
+
+
+def test_recovering_migrated_conflict_resumes_month_output(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    variant_a = sketch(["ticket-a"], 4)
+    variant_b = sketch(["ticket-b"], 5)
+    _legacy_insert(conn, "museum-a", "2026-03-04", 3, 4, variant_a)
+    _legacy_insert(conn, "museum-a\n", "2026-03-04", 3, 5, variant_b)
+    clean_regs = sketch(["clean"], 6)
+    _legacy_insert(conn, "museum-b", "2026-03-09", 1, 6, clean_regs)
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    assert storage.get_monthly("2026-03") is None
+
+    # Same revision as the conflict cannot resolve it: an already-kept variant
+    # is an idempotent no-op, new content at that revision is a conflict.
+    unchanged = storage.ingest("museum-a", "2026-03-04", 3, 4, variant_a)
+    assert unchanged.status == "unchanged"
+    assert unchanged.month_blocked is True
+    with pytest.raises(ConflictError):
+        storage.ingest("museum-a", "2026-03-04", 3, 4, sketch(["brand-new"], 4))
+    assert storage.get_monthly("2026-03") is None
+
+    # A higher revision under the clean venue id clears the conflict.
+    resolved = sketch(["ticket-a", "ticket-c"], 4)
+    outcome = storage.ingest("museum-a", "2026-03-04", 4, 4, resolved)
+    assert outcome.status == "conflict_resolved"
+    assert outcome.month_blocked is False
+    assert storage.get_conflict_day("museum-a", "2026-03-04") is None
+    assert storage.get_conflicts() == []
+
+    summary = storage.get_monthly("2026-03")
+    assert summary is not None
+    assert summary.venue_count == 2
+    assert summary.day_count == 2
+    # Recomputed from the merged current sketches, not any stale summary.
+    expected = hll.merge_sketches([(4, resolved), (6, clean_regs)])
+    assert summary.registers == expected
+    assert summary.p == min(4, 6)
+
+    # The recovered state survives a restart.
+    reopened = Storage(path)
+    after_restart = reopened.get_monthly("2026-03")
+    assert after_restart.registers == summary.registers
+    assert reopened.get_conflicts() == []
+
+
+def test_two_conflicts_must_both_resolve_before_month_resumes(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    _legacy_insert(conn, "v1", "2026-03-01", 2, 4, sketch(["a1"], 4))
+    _legacy_insert(conn, "v1\n", "2026-03-01", 2, 5, sketch(["a2"], 5))
+    _legacy_insert(conn, "v2", "2026-03-02", 2, 4, sketch(["b1"], 4))
+    _legacy_insert(conn, "v2\n", "2026-03-02", 2, 5, sketch(["b2"], 5))
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    assert len(storage.get_conflicts("2026-03")) == 2
+    assert storage.get_monthly("2026-03") is None
+
+    storage.ingest("v1", "2026-03-01", 3, 4, sketch(["a-final"], 4))
+    # One conflict left: the month must still produce nothing.
+    assert storage.get_monthly("2026-03") is None
+    assert len(storage.get_conflicts("2026-03")) == 1
+
+    storage.ingest("v2", "2026-03-02", 3, 4, sketch(["b-final"], 4))
+    summary = storage.get_monthly("2026-03")
+    assert summary is not None
+    assert summary.venue_count == 2
+    expected = hll.merge_sketches(
+        [(4, sketch(["a-final"], 4)), (4, sketch(["b-final"], 4))]
+    )
+    assert summary.registers == expected
+
+
+def test_migration_without_lf_rows_is_a_noop(tmp_path):
+    conn, path = _legacy_db(tmp_path)
+    regs = sketch(["a", "b"], 4)
+    _legacy_insert(conn, "museum-a", "2026-03-04", 1, 4, regs)
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    stored = storage.get_daily("museum-a", "2026-03-04")
+    assert stored.registers == regs
+    assert stored.revision == 1
+    assert storage.get_conflicts() == []
+    assert storage.get_monthly("2026-03").registers == regs
+
+
+def test_ingest_writes_conflict_state_and_summary_atomically(tmp_path, monkeypatch):
+    conn, path = _legacy_db(tmp_path)
+    _legacy_insert(conn, "v1", "2026-03-01", 2, 4, sketch(["a1"], 4))
+    _legacy_insert(conn, "v1\n", "2026-03-01", 2, 5, sketch(["a2"], 5))
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    assert storage.get_monthly("2026-03") is None
+
+    def boom(self, conn, month):
+        raise RuntimeError("simulated crash during summary rebuild")
+
+    monkeypatch.setattr(Storage, "_refresh_month", boom)
+    with pytest.raises(RuntimeError):
+        storage.ingest("v1", "2026-03-01", 3, 4, sketch(["a3"], 4))
+    monkeypatch.undo()
+
+    # Rolled back as a unit: conflict remains, no current row, no summary.
+    reopened = Storage(path)
+    assert reopened.get_daily("v1", "2026-03-01") is None
+    assert reopened.get_conflict_day("v1", "2026-03-01") is not None
+    assert reopened.get_monthly("2026-03") is None

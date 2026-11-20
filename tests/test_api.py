@@ -63,6 +63,35 @@ def test_negative_revision_rejected(client):
     assert response.status_code == 422
 
 
+def test_trailing_lf_venue_id_is_rejected(client):
+    # The original incident: copying a venue code from a text list keeps the
+    # line ending, and the old regex ($ anchor) accepted it.
+    body = payload(sketch(["a"], 4), venue="venue-a\n")
+    response = client.post("/api/v1/daily-sketches", json=body)
+    assert response.status_code == 422
+    assert "CR/LF" in str(response.json()["detail"])
+    # Nothing was stored, neither as a separate venue nor the clean one.
+    assert client.get("/api/v1/daily-sketches/venue-a/2026-03-04").status_code == 404
+
+
+def test_trailing_cr_and_crlf_venue_ids_are_rejected(client):
+    for dirty in ("venue-a\r", "venue-a\r\n", " venue-a", "venue-a "):
+        response = client.post(
+            "/api/v1/daily-sketches", json=payload([0] * 16, venue=dirty)
+        )
+        assert response.status_code == 422, dirty
+
+
+def test_clean_venue_after_rejected_lf_is_created_normally(client):
+    dirty = payload(sketch(["a"], 4), venue="venue-a\n")
+    assert client.post("/api/v1/daily-sketches", json=dirty).status_code == 422
+    clean = payload(sketch(["a"], 4), venue="venue-a")
+    response = client.post("/api/v1/daily-sketches", json=clean)
+    assert response.status_code == 200
+    assert response.json()["status"] == "created"
+    assert response.json()["month_blocked"] is False
+
+
 def test_wrong_register_count_rejected(client):
     response = client.post("/api/v1/daily-sketches", json=payload([0] * 17))
     assert response.status_code == 422
@@ -160,3 +189,209 @@ def test_parallel_backfill_through_http(client):
     data = client.get("/api/v1/reports/monthly/2026-04").json()
     assert data["venue_count"] == 5
     assert data["day_count"] == 5
+
+
+# -- conflict lifecycle (migration-produced or equivalent states) ----------
+
+
+def _seed_conflict(storage, venue="venue-a", day="2026-03-04", rev=3):
+    """Create a conflicted venue-day directly in storage, as the migration would."""
+    import sqlite3
+
+    from app.store import content_fingerprint, utc_now
+
+    conn = sqlite3.connect(storage.path)
+    try:
+        for tag, p in (("a", 4), ("b", 5)):
+            regs = sketch([f"{tag}-ticket"], p)
+            conn.execute(
+                "INSERT INTO daily_conflict "
+                "(venue_id, day, revision, p, registers, content_hash, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    venue,
+                    day,
+                    rev,
+                    p,
+                    bytes(regs),
+                    content_fingerprint(p, regs),
+                    utc_now(),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_blocked_month_returns_409_with_conflict_list(client, tmp_path):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    # One clean venue-day keeps the month otherwise populated.
+    storage.ingest("venue-ok", "2026-03-10", 1, 4, sketch(["ok-ticket"], 4))
+    _seed_conflict(storage)
+
+    response = client.get("/api/v1/reports/monthly/2026-03")
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["error"] == "month_blocked_by_conflicts"
+    assert detail["conflict_count"] == 1
+    conflict = detail["conflicts"][0]
+    assert conflict["venue_id"] == "venue-a"
+    assert conflict["day"] == "2026-03-04"
+    assert conflict["highest_revision"] == 3
+    assert conflict["required_revision"] == 4
+    assert {variant["p"] for variant in conflict["variants"]} == {4, 5}
+
+
+def test_conflicted_daily_read_returns_409_with_variants(client, tmp_path):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    _seed_conflict(storage)
+    response = client.get("/api/v1/daily-sketches/venue-a/2026-03-04")
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["error"] == "venue_day_conflict"
+    assert detail["required_revision"] == 4
+    assert len(detail["conflict"]["variants"]) == 2
+
+
+def test_conflicts_endpoint_lists_all_and_per_month(client, tmp_path):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    _seed_conflict(storage, venue="venue-a", day="2026-03-04")
+    _seed_conflict(storage, venue="venue-b", day="2026-03-20", rev=2)
+    _seed_conflict(storage, venue="venue-c", day="2026-04-02", rev=1)
+
+    all_conflicts = client.get("/api/v1/conflicts")
+    assert all_conflicts.status_code == 200
+    body = all_conflicts.json()
+    assert body["month"] is None
+    assert body["conflict_count"] == 3
+
+    march = client.get("/api/v1/conflicts?month=2026-03").json()
+    assert march["conflict_count"] == 2
+    assert {c["venue_id"] for c in march["conflicts"]} == {"venue-a", "venue-b"}
+
+    empty = client.get("/api/v1/conflicts?month=2026-05").json()
+    assert empty["conflict_count"] == 0
+    assert empty["blocked"] is False
+
+    assert client.get("/api/v1/conflicts?month=bad").status_code == 422
+
+
+def test_stale_and_equal_revisions_against_conflict_do_not_change_state(
+    client, tmp_path
+):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    storage.ingest("venue-ok", "2026-03-10", 1, 4, sketch(["ok"], 4))
+    _seed_conflict(storage, rev=3)
+
+    stale = client.post(
+        "/api/v1/daily-sketches",
+        json=payload(sketch(["new"], 4), revision=2),
+    )
+    assert stale.status_code == 200
+    assert stale.json()["status"] == "ignored"
+    assert stale.json()["current_revision"] == 3
+    assert stale.json()["month_blocked"] is True
+
+    same_rev_new_content = client.post(
+        "/api/v1/daily-sketches",
+        json=payload(sketch(["new"], 4), revision=3),
+    )
+    assert same_rev_new_content.status_code == 409
+    assert same_rev_new_content.json()["detail"]["error"] == "revision_conflict"
+
+    # The month is still blocked and the conflict still has two variants.
+    assert client.get("/api/v1/reports/monthly/2026-03").status_code == 409
+    listed = client.get("/api/v1/conflicts?month=2026-03").json()
+    assert len(listed["conflicts"][0]["variants"]) == 2
+
+
+def test_higher_revision_resolves_conflict_and_report_resumes(client, tmp_path):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    storage.ingest("venue-ok", "2026-03-10", 1, 4, sketch(["ok-ticket"], 4))
+    _seed_conflict(storage, rev=3)
+    assert client.get("/api/v1/reports/monthly/2026-03").status_code == 409
+
+    resolved_regs = sketch(["resolved-ticket", "ok-ticket"], 4)
+    response = client.post(
+        "/api/v1/daily-sketches",
+        json=payload(resolved_regs, revision=4),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "conflict_resolved"
+    assert body["month_blocked"] is False
+
+    # Daily read is a normal sketch again and conflicts are gone.
+    daily = client.get("/api/v1/daily-sketches/venue-a/2026-03-04")
+    assert daily.status_code == 200
+    assert daily.json()["revision"] == 4
+    assert client.get("/api/v1/conflicts").json()["conflict_count"] == 0
+
+    # Monthly output resumed, computed from the merged current sketches.
+    report = client.get("/api/v1/reports/monthly/2026-03")
+    assert report.status_code == 200
+    from app import hll
+
+    expected = hll.sketch_for_tickets(["resolved-ticket", "ok-ticket"], 4)
+    assert report.json()["registers"] == expected
+    assert report.json()["venue_count"] == 2
+    assert report.json()["day_count"] == 2
+
+
+def test_other_venue_backfills_stay_accepted_while_month_blocked(client, tmp_path):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    _seed_conflict(storage, venue="venue-a", day="2026-03-04")
+
+    # A different venue-day follows the ordinary ingest rules while blocked.
+    response = client.post(
+        "/api/v1/daily-sketches",
+        json=payload(sketch(["b-ticket"], 4), venue="venue-b", day="2026-03-05"),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "created"
+    assert response.json()["month_blocked"] is True
+
+    correction = client.post(
+        "/api/v1/daily-sketches",
+        json=payload(
+            sketch(["b-ticket", "b2"], 4),
+            venue="venue-b",
+            day="2026-03-05",
+            revision=2,
+        ),
+    )
+    assert correction.json()["status"] == "replaced"
+    # Still blocked by venue-a; venue-b's current sketch is stored regardless.
+    stored = client.get("/api/v1/daily-sketches/venue-b/2026-03-05").json()
+    assert stored["revision"] == 2
+    assert client.get("/api/v1/reports/monthly/2026-03").status_code == 409
+
+
+def test_summary_returns_404_not_stale_after_migration_blocks_month(client, tmp_path):
+    from app.store import Storage
+
+    storage = Storage(str(tmp_path / "api.db"))
+    storage.ingest("venue-a", "2026-03-04", 1, 4, sketch(["a"], 4))
+    assert client.get("/api/v1/reports/monthly/2026-03").status_code == 200
+    _seed_conflict(storage, venue="venue-z", day="2026-03-15", rev=1)
+
+    # No stale pre-conflict summary may be served: the report is 409 and the
+    # conflict list exposes exactly the seeded venue-day.  (A bare sqlite
+    # insert does not run the service's summary refresh; that withdrawal is
+    # covered at store level in the migration and ingest tests.)
+    blocked = client.get("/api/v1/reports/monthly/2026-03")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["conflicts"][0]["venue_id"] == "venue-z"
+    assert client.get("/api/v1/conflicts").json()["conflict_count"] == 1

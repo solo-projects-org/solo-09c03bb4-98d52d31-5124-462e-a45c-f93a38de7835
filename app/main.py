@@ -11,11 +11,20 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import hll
-from .store import ConflictError, MonthlySummary, Storage
+from .store import (
+    ConflictDay,
+    ConflictError,
+    ConflictVariant,
+    MonthlySummary,
+    Storage,
+)
 
-DAY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
-VENUE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# \Z, not $: Python's $ also matches before a trailing newline, which let a
+# venue id copied from a text list with an LF ("museum-a\n") pass as a second
+# venue.  \Z only matches the very end of the string.
+DAY_PATTERN = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+MONTH_PATTERN = re.compile(r"\A\d{4}-\d{2}\Z")
+VENUE_PATTERN = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
 MAX_REVISION = 2**31 - 1
 
 
@@ -53,6 +62,11 @@ class SketchSubmission(BaseModel):
     @classmethod
     def _venue(cls, value: str) -> str:
         if not VENUE_PATTERN.match(value):
+            if value.endswith(("\n", "\r")):
+                raise ValueError(
+                    "venue_id must not carry trailing CR/LF; resubmit with the "
+                    "clean venue code (allowed: [A-Za-z0-9._-]{1,64})"
+                )
             raise ValueError("venue_id must match [A-Za-z0-9._-]{1,64}")
         return value
 
@@ -84,6 +98,7 @@ class IngestResponse(BaseModel):
     revision: int
     current_revision: int
     month: str
+    month_blocked: bool = False
 
 
 class MonthlyReport(BaseModel):
@@ -94,6 +109,65 @@ class MonthlyReport(BaseModel):
     day_count: int
     venue_count: int
     updated_at: str
+
+
+class ConflictVariantResponse(BaseModel):
+    revision: int
+    p: int
+    registers: list[int]
+    content_hash: str
+    updated_at: str
+
+
+class ConflictDayResponse(BaseModel):
+    venue_id: str
+    day: str
+    month: str
+    highest_revision: int
+    required_revision: int
+    variants: list[ConflictVariantResponse]
+
+
+class ConflictListResponse(BaseModel):
+    month: str | None
+    blocked: bool
+    conflict_count: int
+    conflicts: list[ConflictDayResponse]
+
+
+def _conflict_day(conflict: ConflictDay) -> ConflictDayResponse:
+    return ConflictDayResponse(
+        venue_id=conflict.venue_id,
+        day=conflict.day,
+        month=conflict.month,
+        highest_revision=conflict.highest_revision,
+        required_revision=conflict.required_revision,
+        variants=[_conflict_variant(v) for v in conflict.variants],
+    )
+
+
+def _conflict_variant(variant: ConflictVariant) -> ConflictVariantResponse:
+    return ConflictVariantResponse(
+        revision=variant.revision,
+        p=variant.p,
+        registers=variant.registers,
+        content_hash=variant.content_hash,
+        updated_at=variant.updated_at,
+    )
+
+
+def _conflict_payload(month: str, conflicts: list[ConflictDay]) -> dict:
+    return {
+        "error": "month_blocked_by_conflicts",
+        "message": (
+            f"month {month} has {len(conflicts)} conflicted venue-day(s); "
+            "reports resume after each is resolved with a higher revision "
+            "under the clean venue id"
+        ),
+        "month": month,
+        "conflict_count": len(conflicts),
+        "conflicts": [_conflict_day(conflict).model_dump() for conflict in conflicts],
+    }
 
 
 class HealthResponse(BaseModel):
@@ -148,12 +222,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Museum Combined-Ticket Dedup Service",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Venues submit daily HyperLogLog sketches of combined-ticket ids. "
             "Identical tickets scanned at several venues are counted once. "
             "Monthly reports are served from a persisted summary that is "
-            "rebuilt transactionally from the current daily sketches."
+            "rebuilt transactionally from the current daily sketches. A month "
+            "with unresolved venue-day conflicts (from the legacy LF-suffixed "
+            "venue-id migration or same-revision divergence) produces no "
+            "report until every conflict is resolved by a higher revision."
         ),
         lifespan=lifespan,
     )
@@ -224,6 +301,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
             revision=outcome.revision,
             current_revision=outcome.current_revision,
             month=outcome.month,
+            month_blocked=outcome.month_blocked,
+        )
+
+    @app.get(
+        "/api/v1/conflicts",
+        response_model=ConflictListResponse,
+        tags=["reports"],
+        summary="List conflicted venue-days (optionally for one month)",
+    )
+    def list_conflicts(
+        storage: StorageDep, month: str | None = None
+    ) -> ConflictListResponse:
+        if month is not None:
+            _validate_month(month)
+        conflicts = storage.get_conflicts(month)
+        return ConflictListResponse(
+            month=month,
+            blocked=bool(conflicts),
+            conflict_count=len(conflicts),
+            conflicts=[_conflict_day(conflict) for conflict in conflicts],
         )
 
     @app.get(
@@ -231,9 +328,30 @@ def create_app(db_path: str | None = None) -> FastAPI:
         response_model=SketchResponse,
         tags=["sketches"],
         summary="Read the current sketch for one venue/day",
+        responses={
+            409: {"description": "Venue-day has unresolved content conflicts"},
+        },
     )
     def read_daily(venue_id: str, day: str, storage: StorageDep) -> SketchResponse:
         _validate_path_day(day)
+        conflict = storage.get_conflict_day(venue_id, day)
+        if conflict is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "venue_day_conflict",
+                    "message": (
+                        f"{venue_id}/{day} has {len(conflict.variants)} conflicting "
+                        f"variants; submit revision {conflict.required_revision} or "
+                        "higher with the clean venue id to resolve"
+                    ),
+                    "venue_id": venue_id,
+                    "day": day,
+                    "highest_revision": conflict.highest_revision,
+                    "required_revision": conflict.required_revision,
+                    "conflict": _conflict_day(conflict).model_dump(),
+                },
+            )
         stored = storage.get_daily(venue_id, day)
         if stored is None:
             raise HTTPException(status_code=404, detail="no sketch for that venue/day")
@@ -251,9 +369,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         response_model=MonthlyReport,
         tags=["reports"],
         summary="Monthly deduplicated ticket estimate from the stored summary",
+        responses={
+            409: {"description": "Month has unresolved venue-day conflicts"},
+        },
     )
     def monthly(month: str, storage: StorageDep) -> MonthlyReport:
         _validate_month(month)
+        conflicts = storage.get_conflicts(month)
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail=_conflict_payload(month, conflicts),
+            )
         summary = storage.get_monthly(month)
         if summary is None:
             raise HTTPException(status_code=404, detail=f"no summary for {month}")
