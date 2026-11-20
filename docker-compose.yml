@@ -1,0 +1,27 @@
+services:
+  museum-dedup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: museum-dedup:local
+    container_name: museum-dedup
+    ports:
+      - "8000:8000"
+    environment:
+      MUSEUM_DB_PATH: /data/museum.db
+    volumes:
+      - museum-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+volumes:
+  museum-data:
